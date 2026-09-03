@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Drive AmneziaVPN from the Omarchy bar.
+
+Amnezia ships no session CLI. The GUI accepts `--connect <index>` only on
+startup, and a second instance just raises the window. So connect/disconnect
+restart the GUI: SIGTERM lets its destructor tear the tunnel down, then a new
+process comes up with or without `--connect`. Status is read from QSettings
+(server names only) plus Amnezia's own processes/interfaces — never from
+NetworkManager, which adopts Amnezia's tun device and would otherwise claim it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+APP_NAMES = ("AmneziaVPN",)
+SERVICE_UNIT = "AmneziaVPN.service"
+BINARIES = (
+    Path("/usr/bin/AmneziaVPN"),
+    Path("/opt/AmneziaVPN/bin/AmneziaVPN"),
+)
+CONFIG_CANDIDATES = (
+    Path.home() / ".config/AmneziaVPN.ORG/AmneziaVPN.conf",
+    Path.home() / ".config/AmneziaVPN.ORG/AmneziaVPN/AmneziaVPN.conf",
+)
+TUNNEL_PROCS = (
+    "/opt/AmneziaVPN/bin/tun2socks",
+    "/opt/AmneziaVPN/bin/amneziawg-go",
+    "/opt/AmneziaVPN/bin/openvpn",
+)
+CONTAINER_LABELS = {
+    "amnezia-xray": "XRay",
+    "amnezia-awg": "AmneziaWG",
+    "amnezia-wireguard": "WireGuard",
+    "amnezia-openvpn": "OpenVPN",
+    "amnezia-openvpn-cloak": "OpenVPN Cloak",
+    "amnezia-ss": "Shadowsocks",
+    "amnezia-ikev2": "IKEv2",
+}
+
+
+def which_app() -> Path | None:
+    for candidate in BINARIES:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def pgrep_exact(name: str) -> list[int]:
+    try:
+        out = subprocess.check_output(["pgrep", "-x", name], text=True)
+    except subprocess.CalledProcessError:
+        return []
+    return [int(line) for line in out.splitlines() if line.strip().isdigit()]
+
+
+def pgrep_full(needle: str) -> list[int]:
+    try:
+        out = subprocess.check_output(["pgrep", "-f", needle], text=True)
+    except subprocess.CalledProcessError:
+        return []
+    return [int(line) for line in out.splitlines() if line.strip().isdigit()]
+
+
+def service_running() -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", SERVICE_UNIT],
+            check=False,
+        )
+        return result.returncode == 0
+    except OSError:
+        return bool(pgrep_exact("AmneziaVPN-service"))
+
+
+def app_pids() -> list[int]:
+    return pgrep_exact("AmneziaVPN")
+
+
+def tunnel_pids() -> list[int]:
+    found: list[int] = []
+    for needle in TUNNEL_PROCS:
+        found.extend(pgrep_full(needle))
+    return found
+
+
+def tunnel_iface() -> str:
+    try:
+        links = json.loads(subprocess.check_output(["ip", "-j", "link"], text=True))
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return ""
+    names = []
+    for link in links:
+        name = str(link.get("ifname") or "")
+        flags = link.get("flags") or []
+        if "UP" not in flags:
+            continue
+        if name.startswith("amn") or re.fullmatch(r"tun\d+", name):
+            names.append(name)
+    if any(name.startswith("amn") for name in names):
+        return next(name for name in names if name.startswith("amn"))
+    return names[0] if names else ""
+
+
+def connected() -> bool:
+    if tunnel_pids():
+        return True
+    iface = tunnel_iface()
+    return iface.startswith("amn")
+
+
+def unescape_qt(text: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            mapping = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}
+            if nxt in mapping:
+                out.append(mapping[nxt])
+                i += 2
+                continue
+            if nxt == "x" and i + 3 < len(text):
+                try:
+                    out.append(chr(int(text[i + 2 : i + 4], 16)))
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def read_conf() -> str:
+    for path in CONFIG_CANDIDATES:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    return ""
+
+
+def parse_servers(conf: str) -> tuple[list[dict], str]:
+    default_id = ""
+    match_id = re.search(r"^defaultServerId=(.*)$", conf, re.M)
+    if match_id:
+        default_id = match_id.group(1).strip().strip('"')
+
+    match = re.search(r'serversList="@ByteArray\((.*)\)"\s*(?:\n|$)', conf, re.S)
+    if not match:
+        match = re.search(r"serversList=@ByteArray\((.*)\)\s*(?:\n|$)", conf, re.S)
+    if not match:
+        return [], default_id
+
+    try:
+        payload = json.loads(unescape_qt(match.group(1)))
+    except json.JSONDecodeError:
+        return [], default_id
+    if not isinstance(payload, list):
+        return [], default_id
+
+    servers = []
+    for index, raw in enumerate(payload):
+        if not isinstance(raw, dict):
+            continue
+        container = str(raw.get("defaultContainer") or "")
+        containers = raw.get("containers") or []
+        if not container and isinstance(containers, list):
+            for item in containers:
+                if isinstance(item, dict) and item.get("container"):
+                    container = str(item["container"])
+                    break
+        identity = str(
+            raw.get("id")
+            or raw.get("storageServerId")
+            or raw.get("uuid")
+            or ""
+        )
+        name = str(
+            raw.get("name")
+            or raw.get("description")
+            or raw.get("hostName")
+            or f"Server {index + 1}"
+        )
+        protocol = CONTAINER_LABELS.get(container, "")
+        if not protocol and container.startswith("amnezia-"):
+            protocol = container[len("amnezia-") :].replace("-", " ")
+        servers.append(
+            {
+                "index": index,
+                "key": f"server:{index}",
+                "name": name,
+                "protocol": protocol,
+                "container": container,
+                "id": identity,
+            }
+        )
+    return servers, default_id
+
+
+def current_index(servers: list[dict], default_id: str, is_up: bool) -> int:
+    if not is_up:
+        for server in servers:
+            if default_id and server["id"] == default_id:
+                return int(server["index"])
+        return 0 if servers else -1
+    if default_id:
+        for server in servers:
+            if server["id"] == default_id:
+                return int(server["index"])
+    return 0 if servers else -1
+
+
+def status_payload(error: str = "") -> dict:
+    binary = which_app()
+    servers, default_id = parse_servers(read_conf())
+    is_up = connected()
+    idx = current_index(servers, default_id, is_up)
+    current = next((row for row in servers if row["index"] == idx), None)
+    installed = binary is not None
+    svc = service_running()
+    hint = ""
+    if not installed:
+        hint = "Install AmneziaVPN to manage it from this chip"
+    elif not servers:
+        hint = "Add a server in the AmneziaVPN app"
+    elif not svc:
+        hint = "Start AmneziaVPN.service so the client can bring a tunnel up"
+
+    summary = "Disconnected"
+    if is_up and current:
+        summary = (
+            f"{current['name']} · {current['protocol']}"
+            if current["protocol"]
+            else current["name"]
+        )
+    elif is_up:
+        summary = "Connected"
+
+    return {
+        "ok": error == "",
+        "detected": installed and (len(servers) > 0 or is_up),
+        "installed": installed,
+        "serviceRunning": svc,
+        "appRunning": len(app_pids()) > 0,
+        "connected": is_up,
+        "setupHint": hint,
+        "error": error,
+        "iface": tunnel_iface() if is_up else "",
+        "currentIndex": idx if is_up else (idx if current else -1),
+        "currentKey": current["key"] if (is_up and current) else "",
+        "summary": summary if is_up else "",
+        "servers": servers,
+    }
+
+
+def emit(payload: dict) -> int:
+    json.dump(payload, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0 if payload.get("ok", True) else 1
+
+
+def stop_gui(timeout: float = 8.0) -> None:
+    pids = app_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not app_pids():
+            return
+        time.sleep(0.1)
+    for pid in app_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+
+
+def start_gui(extra: list[str]) -> None:
+    binary = which_app()
+    if binary is None:
+        raise FileNotFoundError("AmneziaVPN is not installed")
+    env = os.environ.copy()
+    env.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+    subprocess.Popen(
+        [str(binary), *extra],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+
+
+def hide_window() -> None:
+    try:
+        subprocess.run(
+            ["hyprctl", "dispatch", "closewindow", "class:^(AmneziaVPN)$"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+def wait_until(predicate, timeout: float, interval: float = 0.4) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def do_connect(index: int) -> dict:
+    servers, _ = parse_servers(read_conf())
+    if not any(server["index"] == index for server in servers):
+        payload = status_payload(f"No Amnezia server at index {index}")
+        payload["ok"] = False
+        return payload
+    if not service_running():
+        payload = status_payload("AmneziaVPN.service is not running")
+        payload["ok"] = False
+        return payload
+    stop_gui()
+    start_gui(["--connect", str(index)])
+    wait_until(lambda: len(app_pids()) > 0, 5)
+    wait_until(connected, 20)
+    hide_window()
+    payload = status_payload()
+    if not payload["connected"]:
+        payload["ok"] = False
+        payload["error"] = "Amnezia did not come up after --connect"
+    return payload
+
+
+def do_disconnect() -> dict:
+    stop_gui()
+    wait_until(lambda: not connected(), 10)
+    # Bring the GUI back so the next connect is a restart, not a cold start,
+    # and so Amnezia's tray/state stays around. Without --connect it stays down.
+    try:
+        start_gui(["--autostart"])
+        wait_until(lambda: len(app_pids()) > 0, 5)
+        hide_window()
+    except FileNotFoundError:
+        pass
+    payload = status_payload()
+    if payload["connected"]:
+        payload["ok"] = False
+        payload["error"] = "Amnezia is still connected"
+    return payload
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) <= 1 or argv[1] in ("status", "list"):
+        return emit(status_payload())
+    command = argv[1]
+    if command == "connect":
+        if len(argv) < 3:
+            return emit(status_payload("connect needs a server index"))
+        try:
+            index = int(argv[2])
+        except ValueError:
+            return emit(status_payload(f"Not a server index: {argv[2]}"))
+        return emit(do_connect(index))
+    if command == "disconnect":
+        return emit(do_disconnect())
+    return emit(status_payload(f"Unknown command: {command}"))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

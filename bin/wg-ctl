@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Toggle NetworkManager WireGuard profiles without touching Amnezia."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+
+
+def run(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(args, check=False, capture_output=True, text=True)
+
+
+def unescape(value: str) -> str:
+    return value.replace("\\:", ":").replace("\\\\", "\\")
+
+
+def split_fields(line: str, count: int) -> list[str]:
+    fields: list[str] = []
+    rest = line
+    for _ in range(count - 1):
+        i = 0
+        found = -1
+        while i < len(rest):
+            if rest[i] == "\\" and i + 1 < len(rest):
+                i += 2
+                continue
+            if rest[i] == ":":
+                found = i
+                break
+            i += 1
+        if found == -1:
+            fields.append(unescape(rest))
+            return fields
+        fields.append(unescape(rest[:found]))
+        rest = rest[found + 1 :]
+    fields.append(unescape(rest))
+    return fields
+
+
+def list_profiles() -> list[dict]:
+    listed = run(["nmcli", "-t", "-f", "NAME,UUID,TYPE,ACTIVE,FILENAME", "connection", "show"])
+    if listed.returncode != 0:
+        listed = run(["nmcli", "-t", "-f", "NAME,UUID,TYPE,ACTIVE", "connection", "show"])
+    profiles = []
+    for line in listed.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = split_fields(line, 5)
+        while len(fields) < 5:
+            fields.append("")
+        name, uuid, kind, active, filename = fields[:5]
+        if kind != "wireguard":
+            continue
+        if filename.startswith("/run/"):
+            continue
+        profiles.append(
+            {
+                "name": name,
+                "uuid": uuid,
+                "key": f"profile:{uuid}",
+                "active": active == "yes",
+            }
+        )
+    return profiles
+
+
+def status_payload(error: str = "") -> dict:
+    profiles = list_profiles()
+    current = next((row for row in profiles if row["active"]), None)
+    return {
+        "ok": error == "",
+        "detected": len(profiles) > 0,
+        "connected": current is not None,
+        "error": error,
+        "currentKey": current["key"] if current else "",
+        "summary": current["name"] if current else "",
+        "profiles": profiles,
+    }
+
+
+def emit(payload: dict) -> int:
+    json.dump(payload, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0 if payload.get("ok", True) else 1
+
+
+def wait_active(uuid: str, want: bool, timeout: float = 8.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        profiles = list_profiles()
+        active = any(row["uuid"] == uuid and row["active"] for row in profiles)
+        if active == want:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def do_connect(uuid: str) -> dict:
+    profiles = list_profiles()
+    if not any(row["uuid"] == uuid for row in profiles):
+        payload = status_payload(f"No WireGuard profile {uuid}")
+        payload["ok"] = False
+        return payload
+    started = run(["nmcli", "connection", "up", "uuid", uuid])
+    if started.returncode != 0:
+        payload = status_payload((started.stderr or started.stdout).strip() or "nmcli connection up failed")
+        payload["ok"] = False
+        return payload
+    wait_active(uuid, True)
+    return status_payload()
+
+
+def do_disconnect(uuid: str = "") -> dict:
+    profiles = list_profiles()
+    targets = [uuid] if uuid else [row["uuid"] for row in profiles if row["active"]]
+    if not targets:
+        return status_payload()
+    for item in targets:
+        stopped = run(["nmcli", "connection", "down", "uuid", item])
+        if stopped.returncode != 0:
+            payload = status_payload((stopped.stderr or stopped.stdout).strip() or "nmcli connection down failed")
+            payload["ok"] = False
+            return payload
+        wait_active(item, False)
+    return status_payload()
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) <= 1 or argv[1] in ("status", "list"):
+        return emit(status_payload())
+    if argv[1] == "connect":
+        if len(argv) < 3:
+            return emit(status_payload("connect needs a profile uuid"))
+        return emit(do_connect(argv[2]))
+    if argv[1] == "disconnect":
+        return emit(do_disconnect(argv[2] if len(argv) > 2 else ""))
+    return emit(status_payload(f"Unknown command: {argv[1]}"))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

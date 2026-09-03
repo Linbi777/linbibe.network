@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "linbibe.network",
+  "name": "My Network",
+  "version": "1.0.0",
+  "author": "Linbi777",
+  "description": "Wi-Fi panel with independent Amnezia VPN and WireGuard tabs",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "My Network",
+    "description": "Wi-Fi, Amnezia VPN, and WireGuard from the network icon",
+    "category": "Network",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.network"
+  }
+}
