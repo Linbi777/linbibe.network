@@ -19,6 +19,7 @@ Item {
   property bool wgBusy: false
   property string amneziaDetail: ""
   property string wgDetail: ""
+  property string amneziaPending: "" // "connect" | "disconnect"
 
   implicitHeight: content.implicitHeight
   width: parent ? parent.width : implicitWidth
@@ -49,6 +50,7 @@ Item {
     var connected = amnezia.connected === true
     var args = connected ? ["disconnect"] : ["connect", "0"]
     amneziaBusy = true
+    amneziaPending = connected ? "disconnect" : "connect"
     amneziaDetail = connected ? "Disconnecting…" : "Connecting…"
     amneziaAction.command = [amneziaHelper].concat(args)
     amneziaAction.running = true
@@ -89,6 +91,13 @@ Item {
     onTriggered: root.refresh()
   }
 
+  Timer {
+    id: amneziaCooldown
+    interval: 1800
+    repeat: false
+    onTriggered: root.amneziaBusy = false
+  }
+
   Process {
     id: amneziaProc
     command: [root.amneziaHelper, "status"]
@@ -117,7 +126,8 @@ Item {
     stdout: StdioCollector { id: amneziaActOut; waitForEnd: true }
     stderr: StdioCollector { id: amneziaActErr; waitForEnd: true }
     onExited: function(code) {
-      root.amneziaBusy = false
+      var pending = root.amneziaPending
+      root.amneziaPending = ""
       var parsed = root.parseJson(amneziaActOut.text, null)
       if (parsed) root.amnezia = parsed
       if (code !== 0) {
@@ -126,6 +136,14 @@ Item {
         root.amneziaDetail = ""
       }
       root.refreshAmnezia()
+      // After a real disconnect the switch is already off; a second click
+      // would fire connect. Keep busy briefly so "off" cannot reconnect.
+      if (code === 0 && pending === "disconnect" && parsed && parsed.connected === false) {
+        root.amneziaBusy = true
+        amneziaCooldown.restart()
+      } else {
+        root.amneziaBusy = false
+      }
     }
   }
 

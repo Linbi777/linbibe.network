@@ -2,11 +2,15 @@
 """Drive AmneziaVPN from the Omarchy bar.
 
 Amnezia ships no session CLI. The GUI accepts `--connect <index>` only on
-startup, and a second instance just raises the window. So connect/disconnect
-restart the GUI: SIGTERM lets its destructor tear the tunnel down, then a new
-process comes up with or without `--connect`. Status is read from QSettings
-(server names only) plus Amnezia's own processes/interfaces — never from
-NetworkManager, which adopts Amnezia's tun device and would otherwise claim it.
+startup, and a second instance just raises the window. Connect restarts the
+GUI with `--connect`. Disconnect SIGTERMs the GUI so its destructor can ask
+the privileged service to drop tun2socks / tun2 / XRay — then leaves the GUI
+dead. Restarting with `--autostart` (or SIGKILL mid-teardown) leaves the
+tunnel up while the chip looks off, which breaks other VPNs such as Docker.
+
+Status is read from QSettings (server names only) plus Amnezia's own
+processes/interfaces — never from NetworkManager, which adopts Amnezia's tun
+device and would otherwise claim it.
 """
 
 from __future__ import annotations
@@ -14,7 +18,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -30,11 +36,15 @@ CONFIG_CANDIDATES = (
     Path.home() / ".config/AmneziaVPN.ORG/AmneziaVPN.conf",
     Path.home() / ".config/AmneziaVPN.ORG/AmneziaVPN/AmneziaVPN.conf",
 )
+# Anchored so `docker run ... tun2socks` in some other argv cannot match.
 TUNNEL_PROCS = (
-    "/opt/AmneziaVPN/bin/tun2socks",
-    "/opt/AmneziaVPN/bin/amneziawg-go",
-    "/opt/AmneziaVPN/bin/openvpn",
+    "^/opt/AmneziaVPN/bin/tun2socks",
+    "^/opt/AmneziaVPN/bin/amneziawg-go",
+    "^/opt/AmneziaVPN/bin/openvpn",
+    "/tmp/AmneziaVPN.run",
 )
+# XRay in the official client always names the device tun2.
+XRAY_TUN = "tun2"
 CONTAINER_LABELS = {
     "amnezia-xray": "XRay",
     "amnezia-awg": "AmneziaWG",
@@ -102,7 +112,7 @@ def tunnel_iface() -> str:
         flags = link.get("flags") or []
         if "UP" not in flags:
             continue
-        if name.startswith("amn") or re.fullmatch(r"tun\d+", name):
+        if name.startswith("amn") or name == XRAY_TUN:
             names.append(name)
     if any(name.startswith("amn") for name in names):
         return next(name for name in names if name.startswith("amn"))
@@ -113,7 +123,9 @@ def connected() -> bool:
     if tunnel_pids():
         return True
     iface = tunnel_iface()
-    return iface.startswith("amn")
+    if iface.startswith("amn") or iface == XRAY_TUN:
+        return True
+    return False
 
 
 def unescape_qt(text: str) -> str:
@@ -271,29 +283,306 @@ def emit(payload: dict) -> int:
     return 0 if payload.get("ok", True) else 1
 
 
-def stop_gui(timeout: float = 8.0) -> None:
-    pids = app_pids()
+def signal_pids(pids: list[int], sig: signal.Signals) -> None:
     for pid in pids:
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, sig)
         except ProcessLookupError:
             continue
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not app_pids():
-            return
-        time.sleep(0.1)
-    for pid in app_pids():
+        except PermissionError:
+            continue
+
+
+def stop_user_xray() -> None:
+    pids = pgrep_full("/tmp/AmneziaVPN.run")
+    signal_pids(pids, signal.SIGTERM)
+    time.sleep(0.2)
+    signal_pids(pgrep_full("/tmp/AmneziaVPN.run"), signal.SIGKILL)
+
+
+def daemon_deactivate() -> None:
+    # Mozilla-style daemon used by AmneziaWG. Harmless no-op for XRay, but
+    # it is the only unprivileged stop API on the service socket.
+    path = "/var/run/amneziavpn/daemon.socket"
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        sock.connect(path)
+        sock.sendall(b'{"type":"deactivate"}\n')
         try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            continue
+            sock.recv(256)
+        except OSError:
+            pass
+        sock.close()
+    except OSError:
+        return
+
+
+def docker_drop_tunnel() -> str:
+    # Passwordless leftover cleanup: the user is in the docker group.
+    # Runs amnezia-drop-tun against the host (pid/net) so killswitch/DNS/IPv6
+    # are restored, not just tun2 deleted.
+    helper = Path(__file__).resolve().with_name("amnezia-drop-tun")
+    if not helper.is_file():
+        return "missing amnezia-drop-tun"
+    try:
+        os.chmod(helper, 0o755)
+    except OSError:
+        pass
+    image = "vpn:with_certs"
+    try:
+        probed = subprocess.check_output(
+            ["/usr/bin/docker", "inspect", "-f", "{{.Config.Image}}", "vpn_reserve"],
+            text=True,
+            timeout=3,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if probed:
+            image = probed
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/docker",
+                "run",
+                "--rm",
+                "--privileged",
+                "--pid=host",
+                "--network",
+                "host",
+                "-v",
+                f"{helper}:/amnezia-drop-tun:ro",
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "/amnezia-drop-tun",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        return "docker cleanup timed out"
+    except OSError as exc:
+        return str(exc)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        return err or f"docker exited {result.returncode}"
+    return ""
+
+
+def pkexec_drop_tunnel() -> str:
+    helper = Path(__file__).with_name("amnezia-drop-tun")
+    if not helper.is_file():
+        return "missing amnezia-drop-tun"
+    try:
+        os.chmod(helper, 0o755)
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            ["pkexec", str(helper)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "polkit prompt timed out"
+    except OSError as exc:
+        return str(exc)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        return err or f"pkexec exited {result.returncode}"
+    return ""
+
+
+def drop_privileged_tunnel() -> str:
+    docker_err = docker_drop_tunnel()
+    if docker_err == "":
+        restore_user_network()
+        return ""
+    pkexec_err = pkexec_drop_tunnel()
+    restore_user_network()
+    if pkexec_err == "":
+        return ""
+    return pkexec_err or docker_err
+
+
+def sysctl_ipv6_disabled(iface: str) -> bool:
+    path = Path(f"/proc/sys/net/ipv6/conf/{iface}/disable_ipv6")
+    try:
+        return path.read_text(encoding="ascii").strip() == "1"
+    except OSError:
+        return False
+
+
+def wifi_device() -> str:
+    try:
+        out = subprocess.check_output(
+            ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"],
+            text=True,
+            timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and parts[1] == "wifi" and parts[2] == "connected":
+            return parts[0]
+    return ""
+
+
+def restore_user_network() -> None:
+    wifi = wifi_device()
+    try:
+        subprocess.run(
+            ["resolvectl", "flush-caches"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if not wifi:
+        return
+    try:
+        subprocess.run(
+            ["nmcli", "device", "reapply", wifi],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def leftover_after_drop() -> str:
+    if connected():
+        return "Amnezia tunnel is still up"
+    if Path("/sys/class/net/tun2").exists():
+        return "tun2 is still present"
+    if sysctl_ipv6_disabled("all") or sysctl_ipv6_disabled("default"):
+        wifi = wifi_device()
+        if wifi and sysctl_ipv6_disabled(wifi):
+            return "IPv6 is still disabled on Wi-Fi (Amnezia leftover)"
+        return "IPv6 is still globally disabled (Amnezia leftover)"
+    return ""
+
+
+def ping_ok(host: str, timeout: int = 2) -> bool:
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", f"-W{timeout}", host],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def curl_ok(url: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["curl", "-4", "-sS", "-o", "/dev/null", "-m", "5", url],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def default_gateway() -> str:
+    try:
+        routes = json.loads(
+            subprocess.check_output(
+                ["ip", "-j", "route", "show", "default"],
+                text=True,
+                timeout=3,
+            )
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return ""
+    if not isinstance(routes, list):
+        return ""
+    for row in routes:
+        gw = row.get("gateway")
+        if gw:
+            return str(gw)
+    return ""
+
+
+def probe_plain_internet() -> str:
+    gw = default_gateway()
+    if not gw:
+        return "no default route after disconnect"
+    if not ping_ok(gw):
+        return f"gateway {gw} unreachable"
+    if curl_ok("https://1.1.1.1") or ping_ok("1.1.1.1", 3):
+        return ""
+    return "no IPv4 to the internet on Wi-Fi"
+
+
+def stop_gui(timeout: float = 20.0, force: bool = False) -> None:
+    # SIGTERM runs ~AmneziaApplication, which BlockingQueued-calls
+    # disconnectFromVpn. The privileged tun2socks / tun2 live under
+    # AmneziaVPN-service, so SIGKILL here skips teardown and leaves them up.
+    signal_pids(app_pids(), signal.SIGTERM)
+    wait_until(lambda: not app_pids(), timeout, 0.1)
+    if force:
+        signal_pids(app_pids(), signal.SIGKILL)
+        wait_until(lambda: not app_pids(), 2, 0.1)
+
+
+def hypr_dispatch(lua: str) -> None:
+    try:
+        subprocess.run(
+            ["hyprctl", "dispatch", lua],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
 
 
 def start_gui(extra: list[str]) -> None:
     binary = which_app()
     if binary is None:
         raise FileNotFoundError("AmneziaVPN is not installed")
+    # Spawn through Hyprland so the window is born on a silent workspace
+    # instead of flashing on the current one. --connect only works as a
+    # first instance, so this is the only moment the GUI has to exist.
+    cmd = " ".join(shlex.quote(part) for part in [str(binary), *extra])
+    lua = (
+        f"hl.dsp.exec_cmd({json.dumps(cmd)}, "
+        '{ workspace = "special:amnezia silent", no_initial_focus = true, '
+        "no_anim = true })"
+    )
+    try:
+        result = subprocess.run(
+            ["hyprctl", "dispatch", lua],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0 and "error" not in (result.stdout + result.stderr).lower():
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     env = os.environ.copy()
     env.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
     subprocess.Popen(
@@ -306,16 +595,14 @@ def start_gui(extra: list[str]) -> None:
 
 
 def hide_window() -> None:
-    try:
-        subprocess.run(
-            ["hyprctl", "dispatch", "closewindow", "class:^(AmneziaVPN)$"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=2,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return
+    # Amnezia treats a close request as hide-to-tray (it never quits).
+    # Hyprland 0.55+ only accepts Lua dispatchers; the old closewindow
+    # form was a no-op, which is why the window kept popping up.
+    hypr_dispatch('hl.dsp.window.close({ window = "class:AmneziaVPN" })')
+    hypr_dispatch(
+        'hl.dsp.window.move({ workspace = "special:amnezia", follow = false, '
+        'window = "class:AmneziaVPN" })'
+    )
 
 
 def wait_until(predicate, timeout: float, interval: float = 0.4) -> bool:
@@ -325,6 +612,21 @@ def wait_until(predicate, timeout: float, interval: float = 0.4) -> bool:
             return True
         time.sleep(interval)
     return predicate()
+
+
+def shutdown_client() -> str:
+    # Destructor never drops tun2socks. SIGKILL the GUI first so it cannot
+    # respawn the tunnel after we delete tun2, then restore host networking.
+    stop_gui(timeout=4.0, force=True)
+    stop_user_xray()
+    daemon_deactivate()
+    drop_error = drop_privileged_tunnel()
+    if app_pids():
+        stop_gui(timeout=2.0, force=True)
+        stop_user_xray()
+        again = drop_privileged_tunnel()
+        drop_error = drop_error or again
+    return drop_error
 
 
 def do_connect(index: int) -> dict:
@@ -337,10 +639,18 @@ def do_connect(index: int) -> dict:
         payload = status_payload("AmneziaVPN.service is not running")
         payload["ok"] = False
         return payload
-    stop_gui()
+    shutdown_client()
+    if app_pids():
+        # --connect is ignored on a second instance; the running GUI must go.
+        stop_gui(timeout=2.0, force=True)
     start_gui(["--connect", str(index)])
     wait_until(lambda: len(app_pids()) > 0, 5)
-    wait_until(connected, 20)
+
+    def up_and_hidden() -> bool:
+        hide_window()
+        return connected()
+
+    wait_until(up_and_hidden, 20, 0.15)
     hide_window()
     payload = status_payload()
     if not payload["connected"]:
@@ -350,20 +660,27 @@ def do_connect(index: int) -> dict:
 
 
 def do_disconnect() -> dict:
-    stop_gui()
-    wait_until(lambda: not connected(), 10)
-    # Bring the GUI back so the next connect is a restart, not a cold start,
-    # and so Amnezia's tray/state stays around. Without --connect it stays down.
-    try:
-        start_gui(["--autostart"])
-        wait_until(lambda: len(app_pids()) > 0, 5)
-        hide_window()
-    except FileNotFoundError:
-        pass
-    payload = status_payload()
-    if payload["connected"]:
+    drop_error = shutdown_client()
+    wait_until(lambda: leftover_after_drop() == "", 4, 0.25)
+    leftover = leftover_after_drop() or drop_error
+    if not leftover:
+        leftover = probe_plain_internet()
+    payload = status_payload(leftover)
+    if leftover:
         payload["ok"] = False
-        payload["error"] = "Amnezia is still connected"
+        payload["error"] = leftover
+    return payload
+
+
+def do_repair() -> dict:
+    drop_error = drop_privileged_tunnel()
+    leftover = leftover_after_drop() or drop_error
+    if not leftover:
+        leftover = probe_plain_internet()
+    payload = status_payload(leftover)
+    if leftover:
+        payload["ok"] = False
+        payload["error"] = leftover
     return payload
 
 
@@ -381,6 +698,8 @@ def main(argv: list[str]) -> int:
         return emit(do_connect(index))
     if command == "disconnect":
         return emit(do_disconnect())
+    if command == "repair":
+        return emit(do_repair())
     return emit(status_payload(f"Unknown command: {command}"))
 
 

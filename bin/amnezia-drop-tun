@@ -1,0 +1,112 @@
+#!/bin/sh
+# Restore host networking after Amnezia. Run as root on the host, or via:
+#   docker run --privileged --pid=host --network host -v thisfile:/script:ro --entrypoint /bin/sh IMAGE /script
+# Does not touch Docker VPN interfaces, NetworkManager WireGuard, or AmneziaVPN-service.
+set -eu
+
+in_container() {
+  [ -f /.dockerenv ] || grep -q 'docker\|containerd' /proc/1/cgroup 2>/dev/null
+}
+
+host() {
+  if in_container && command -v nsenter >/dev/null 2>&1; then
+    nsenter -t 1 -m -n -p -- "$@"
+  else
+    "$@"
+  fi
+}
+
+kill_amnezia_bin() {
+  prefix=$1
+  pids=$(host pgrep -f "^${prefix}" 2>/dev/null) || return 0
+  for pid in $pids; do
+    host kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 0.2
+  pids=$(host pgrep -f "^${prefix}" 2>/dev/null) || return 0
+  for pid in $pids; do
+    host kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
+# tun2socks is root and respawns tun2 if left alive. Do not match docker argv.
+kill_amnezia_bin /opt/AmneziaVPN/bin/tun2socks
+kill_amnezia_bin /opt/AmneziaVPN/bin/amneziawg-go
+kill_amnezia_bin /opt/AmneziaVPN/bin/openvpn
+kill_amnezia_bin /tmp/AmneziaVPN.run
+
+# DNS Domain "~." is bound to tun2. revert is a no-op after the iface is gone.
+host resolvectl revert tun2 2>/dev/null || true
+host sh -c 'for iface in /sys/class/net/amn*; do
+  [ -e "$iface" ] || continue
+  resolvectl revert "$(basename "$iface")" 2>/dev/null || true
+done
+true'
+
+host sh -c 'ip route flush dev tun2 2>/dev/null || true
+ip link set tun2 down 2>/dev/null || true
+ip link delete tun2 2>/dev/null || true
+for iface in /sys/class/net/amn*; do
+  [ -e "$iface" ] || continue
+  name=$(basename "$iface")
+  ip link set "$name" down 2>/dev/null || true
+  ip link delete "$name" 2>/dev/null || true
+done
+true'
+
+# XRay sets disable_ipv6=1 on all / default / wifi. Re-enable every iface.
+host sh -c 'for f in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+  [ -w "$f" ] || continue
+  echo 0 > "$f" 2>/dev/null || true
+done
+true'
+
+flush_iptables_family() {
+  ipt=$1
+  host sh -c "
+    command -v $ipt >/dev/null 2>&1 || exit 0
+    for chain in INPUT OUTPUT FORWARD; do
+      while $ipt -C \"\$chain\" -j amnvpn.anchors 2>/dev/null; do
+        $ipt -D \"\$chain\" -j amnvpn.anchors 2>/dev/null || break
+      done
+    done
+    chains=\$($ipt-save 2>/dev/null | awk '/^:amnvpn/ { n=\$1; sub(/^:/,\"\",n); sub(/ .*/,\"\",n); print n }')
+    for chain in \$chains; do
+      $ipt -F \"\$chain\" 2>/dev/null || true
+    done
+    for chain in \$chains; do
+      $ipt -X \"\$chain\" 2>/dev/null || true
+    done
+    $ipt -t mangle -F AMNVPN 2>/dev/null || true
+    $ipt -t mangle -X AMNVPN 2>/dev/null || true
+    true
+  "
+}
+
+flush_iptables_family iptables
+flush_iptables_family ip6tables
+
+host ip route flush table 200 2>/dev/null || true
+host ip route flush table amnvpnrt 2>/dev/null || true
+host ip -6 route flush table 200 2>/dev/null || true
+host ip -6 route flush table amnvpnrt 2>/dev/null || true
+host ip rule del lookup amnvpnrt 2>/dev/null || true
+host ip rule del fwmark 0x3211 2>/dev/null || true
+host ip -6 rule del lookup amnvpnrt 2>/dev/null || true
+host ip -6 rule del fwmark 0x3211 2>/dev/null || true
+
+host resolvectl flush-caches 2>/dev/null || true
+
+# Put Wi-Fi back as the DNS and default-route device.
+host sh -c '
+WIFI=$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | awk -F: '\''$2=="wifi" && $3=="connected"{print $1; exit}'\'')
+if [ -n "$WIFI" ]; then
+  nmcli device reapply "$WIFI" 2>/dev/null || true
+  CONN=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v d="$WIFI" '\''$2==d{print $1; exit}'\'')
+  [ -n "$CONN" ] && nmcli connection up "$CONN" >/dev/null 2>&1 || true
+fi
+resolvectl flush-caches 2>/dev/null || true
+true
+'
+
+exit 0

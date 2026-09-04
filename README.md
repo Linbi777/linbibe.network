@@ -26,5 +26,8 @@ If a stock `omarchy.network` widget is still on the bar, remove it so only this 
 
 ## Notes
 
-Amnezia has no session CLI, so connect/disconnect restarts the GUI with `--connect`.
+Amnezia has no session CLI: connect restarts the GUI with `--connect`. Disconnect
+SIGTERMs the client, then restores the host network (tun2, DNS, IPv6, killswitch)
+so other VPNs and plain Wi-Fi keep working. It does **not** relaunch with
+`--autostart`.
 WireGuard uses existing NetworkManager profiles and does not tear Amnezia down.
